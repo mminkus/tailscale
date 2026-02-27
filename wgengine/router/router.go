@@ -131,7 +131,7 @@ type Config struct {
 	// flow logging and is otherwise ignored.
 	SubnetRoutes []netip.Prefix
 
-	// Linux-only things below, ignored on other platforms.
+	// Linux and FreeBSD things below, ignored on other platforms.
 	SNATSubnetRoutes  bool                   // SNAT traffic to local subnets
 	StatefulFiltering bool                   // Apply stateful filtering to inbound connections
 	NetfilterMode     preftype.NetfilterMode // how much to manage netfilter rules
