@@ -729,10 +729,20 @@ func handleSubnetsInNetstack() bool {
 		return true
 	}
 	switch runtime.GOOS {
-	case "windows", "darwin", "freebsd", "openbsd", "solaris", "illumos":
+	case "windows", "darwin", "openbsd", "solaris", "illumos":
 		// Enable on Windows and tailscaled-on-macOS (this doesn't
-		// affect the GUI clients), and on FreeBSD.
+		// affect the GUI clients).
 		return true
+	case "freebsd":
+		// FreeBSD supports kernel-level IP forwarding, so subnet
+		// routing can be handled by the OS with proper configuration
+		// (sysctl net.inet.ip.forwarding=1 and PF rules). Using
+		// kernel forwarding preserves source IPs for forwarded
+		// packets, which is required for protocols like RADIUS (UDP)
+		// where the source IP must be preserved end-to-end. Netstack
+		// subnet forwarding rewrites source IPs when it re-sends
+		// packets via OS sockets.
+		return false
 	}
 	return false
 }
