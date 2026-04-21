@@ -4,14 +4,18 @@
 package osrouter
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/backoff"
 	"tailscale.com/wgengine/router"
 )
 
@@ -99,6 +103,9 @@ const pfAnchorName = "tailscale"
 // Flag to determine whether PF anchors were added and should be removed during cleanUp
 var shouldCleanupPfAnchors atomic.Bool
 
+// Maximum number of retries to modify the PF main ruleset
+const maxPFRetries = 10
+
 // addPFNATRules configures PF to masquerade traffic from Tailscale addresses
 // leaving via non-Tailscale interfaces. This is the FreeBSD equivalent of the
 // Linux iptables MASQUERADE rule used for subnet routing.
@@ -115,7 +122,7 @@ func (r *freebsdRouter) addPFNATRules() error {
 	// Ensure the main ruleset references our anchor so PF evaluates it.
 	// We add both a nat-anchor (for NAT rules) and an anchor (for filter
 	// rules, currently just "pass" to avoid blocking) if not already present.
-	if err := ensurePFAnchorRef(); err != nil {
+	if err := ensurePFAnchorRef(r.logf); err != nil {
 		return fmt.Errorf("ensuring PF anchor reference: %w", err)
 	}
 
@@ -144,7 +151,6 @@ func getPFMainRuleset() (scrubRules, natRules, filterRules string) {
 	if out, err := cmd("pfctl", "-s", "nat").CombinedOutput(); err == nil {
 		natRules = string(out)
 	}
-
 	if out, err := cmd("pfctl", "-s", "rules").CombinedOutput(); err == nil {
 		var scrubLines, filterLines strings.Builder
 		for filterLine := range strings.Lines(string(out)) {
@@ -163,12 +169,24 @@ func getPFMainRuleset() (scrubRules, natRules, filterRules string) {
 
 // loadPFMainRuleset replaces the main PF ruleset with the given combined
 // NAT + filter rules.
-func loadPFMainRuleset(rules string) error {
-	pfctl := exec.Command("pfctl", "-N", "-R", "-Tload", "-f", "-")
-	pfctl.Stdin = strings.NewReader(rules)
-	out, err := pfctl.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("pfctl -f: %v (%s)", err, strings.TrimSpace(string(out)))
+func loadPFMainRuleset(logf logger.Logf, rules string) error {
+	bo := backoff.NewBackoff("pfctl", logf, 2*time.Second)
+	var retries int
+	for {
+		pfctl := exec.Command("pfctl", "-N", "-R", "-Tload", "-f", "-")
+		pfctl.Stdin = strings.NewReader(rules)
+		out_bytes, err := pfctl.CombinedOutput()
+		out := string(out_bytes)
+		if err == nil {
+			break
+		} else if strings.Contains(out, "Device busy") && retries < maxPFRetries {
+			// Retry if /dev/pf ioctl returns EBUSY, usually due to concurrent access
+			bo.BackOff(context.Background(), err)
+			retries++
+			continue
+		}
+
+		return fmt.Errorf("pfctl -N -R -Tload -f: %v (%s)", err, strings.TrimSpace(out))
 	}
 	return nil
 }
@@ -179,10 +197,9 @@ func loadPFMainRuleset(rules string) error {
 //
 // We read the current main ruleset and prepend the references only if they're
 // not already present, then reload the combined ruleset.
-func ensurePFAnchorRef() error {
+func ensurePFAnchorRef(logf logger.Logf) error {
 	scrubRules, natRules, filterRules := getPFMainRuleset()
 
-	var additions string
 	natAnchorRef := fmt.Sprintf("nat-anchor \"%s\"", pfAnchorName)
 	filterAnchorRef := fmt.Sprintf("anchor \"%s\"", pfAnchorName)
 
@@ -212,7 +229,7 @@ func ensurePFAnchorRef() error {
 // removePFAnchorRef removes the nat-anchor and anchor references for
 // "tailscale" from the main PF ruleset via read-modify-write, leaving
 // all other rules intact.
-func removePFAnchorRef() error {
+func removePFAnchorRef(logf logger.Logf) error {
 	scrubRules, natRules, filterRules := getPFMainRuleset()
 
 	natAnchorRef := fmt.Sprintf("nat-anchor \"%s\"", pfAnchorName)
@@ -225,7 +242,7 @@ func removePFAnchorRef() error {
 		return nil // nothing to remove
 	}
 
-	return loadPFMainRuleset(scrubRules+newNat+newFilter)
+	return loadPFMainRuleset(logf, scrubRules+newNat+newFilter)
 }
 
 // removeLines removes all lines from s that contain substr.
