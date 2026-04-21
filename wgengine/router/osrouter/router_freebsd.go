@@ -137,12 +137,23 @@ func (r *freebsdRouter) addPFNATRules() error {
 }
 
 // getPFMainRuleset reads the current main PF filter and NAT rules.
-func getPFMainRuleset() (filterRules, natRules string) {
-	if out, err := cmd("pfctl", "-s", "rules").CombinedOutput(); err == nil {
-		filterRules = string(out)
-	}
+func getPFMainRuleset() (scrubRules, natRules, filterRules string) {
 	if out, err := cmd("pfctl", "-s", "nat").CombinedOutput(); err == nil {
 		natRules = string(out)
+	}
+
+	if out, err := cmd("pfctl", "-s", "rules").CombinedOutput(); err == nil {
+		var scrubLines, filterLines strings.Builder
+		for filterLine := range strings.Lines(string(out)) {
+			if strings.HasPrefix(filterLine, "scrub") {
+				scrubLines.WriteString(filterLine)
+			} else {
+				filterLines.WriteString(filterLine)
+			}
+		}
+
+		scrubRules = scrubLines.String()
+		filterRules = filterLines.String()
 	}
 	return
 }
@@ -150,7 +161,7 @@ func getPFMainRuleset() (filterRules, natRules string) {
 // loadPFMainRuleset replaces the main PF ruleset with the given combined
 // NAT + filter rules.
 func loadPFMainRuleset(rules string) error {
-	pfctl := exec.Command("pfctl", "-f", "-")
+	pfctl := exec.Command("pfctl", "-N", "-R", "-Tload", "-f", "-")
 	pfctl.Stdin = strings.NewReader(rules)
 	out, err := pfctl.CombinedOutput()
 	if err != nil {
@@ -166,44 +177,47 @@ func loadPFMainRuleset(rules string) error {
 // We read the current main ruleset and prepend the references only if they're
 // not already present, then reload the combined ruleset.
 func ensurePFAnchorRef() error {
-	filterRules, natRules := getPFMainRuleset()
+	scrubRules, natRules, filterRules := getPFMainRuleset()
 
 	var additions string
 	natAnchorRef := fmt.Sprintf("nat-anchor \"%s\"", pfAnchorName)
-	anchorRef := fmt.Sprintf("anchor \"%s\"", pfAnchorName)
+	filterAnchorRef := fmt.Sprintf("anchor \"%s\"", pfAnchorName)
 
-	if !strings.Contains(natRules, natAnchorRef) {
-		additions += natAnchorRef + "\n"
-	}
-	if !strings.Contains(filterRules, anchorRef) {
-		additions += anchorRef + "\n"
-	}
-	if additions == "" {
-		return nil // already present
-	}
+	newNat := natRules
+	newFilter := filterRules
 
 	// Prepend our anchor references so they're evaluated, then include
 	// all existing rules so we don't disrupt the user's configuration.
-	return loadPFMainRuleset(additions + natRules + filterRules)
+	if !strings.Contains(natRules, natAnchorRef) {
+		newNat = natAnchorRef + "\n" + natRules
+	}
+	if !strings.Contains(filterRules, filterAnchorRef) {
+		newFilter = filterAnchorRef + "\n" + filterRules
+	}
+	if newNat == natRules && newFilter == filterRules {
+		return nil // already present
+	}
+
+	return loadPFMainRuleset(scrubRules+newNat+newFilter)
 }
 
 // removePFAnchorRef removes the nat-anchor and anchor references for
 // "tailscale" from the main PF ruleset via read-modify-write, leaving
 // all other rules intact.
 func removePFAnchorRef() error {
-	filterRules, natRules := getPFMainRuleset()
+	scrubRules, natRules, filterRules := getPFMainRuleset()
 
 	natAnchorRef := fmt.Sprintf("nat-anchor \"%s\"", pfAnchorName)
-	anchorRef := fmt.Sprintf("anchor \"%s\"", pfAnchorName)
+	filterAnchorRef := fmt.Sprintf("anchor \"%s\"", pfAnchorName)
 
 	newNat := removeLines(natRules, natAnchorRef)
-	newFilter := removeLines(filterRules, anchorRef)
+	newFilter := removeLines(filterRules, filterAnchorRef)
 
 	if newNat == natRules && newFilter == filterRules {
 		return nil // nothing to remove
 	}
 
-	return loadPFMainRuleset(newNat + newFilter)
+	return loadPFMainRuleset(scrubRules+newNat+newFilter)
 }
 
 // removeLines removes all lines from s that contain substr.
