@@ -96,6 +96,9 @@ func (r *freebsdRouter) enableIPForwarding() {
 // configuration; we only ever flush or modify rules inside this anchor.
 const pfAnchorName = "tailscale"
 
+// Flag to determine whether PF anchors were added and should be removed during cleanUp
+var shouldCleanupPfAnchors atomic.Bool
+
 // addPFNATRules configures PF to masquerade traffic from Tailscale addresses
 // leaving via non-Tailscale interfaces. This is the FreeBSD equivalent of the
 // Linux iptables MASQUERADE rule used for subnet routing.
@@ -198,7 +201,12 @@ func ensurePFAnchorRef() error {
 		return nil // already present
 	}
 
-	return loadPFMainRuleset(scrubRules+newNat+newFilter)
+	err := loadPFMainRuleset(r.logf, scrubRules+newNat+newFilter)
+	if err == nil {
+		shouldCleanupPfAnchors.Store(true)
+		r.logf("added PF anchors to main ruleset")
+	}
+	return err
 }
 
 // removePFAnchorRef removes the nat-anchor and anchor references for
@@ -240,9 +248,13 @@ func (r *freebsdRouter) delPFNATRules() error {
 	if out, err := cmd("pfctl", "-a", pfAnchorName, "-F", "all").CombinedOutput(); err != nil {
 		return fmt.Errorf("pfctl -a %s -F all: %v (%s)", pfAnchorName, err, strings.TrimSpace(string(out)))
 	}
-	// Remove the anchor references from the main ruleset.
-	if err := removePFAnchorRef(); err != nil {
-		return fmt.Errorf("removing PF anchor reference: %w", err)
+
+	if shouldCleanupPfAnchors.CompareAndSwap(true, false) {
+		// Remove the anchor references from the main ruleset.
+		if err := removePFAnchorRef(r.logf); err != nil {
+			return fmt.Errorf("removing PF anchor reference: %w", err)
+		}
+		r.logf("removed PF anchors from main ruleset")
 	}
 	return nil
 }
@@ -257,9 +269,11 @@ func cleanUp(logf logger.Logf, interfaceName string) {
 	if out, err := cmd("pfctl", "-a", pfAnchorName, "-F", "all").CombinedOutput(); err != nil {
 		logf("pfctl flush anchor %s: %v (%s)", pfAnchorName, err, strings.TrimSpace(string(out)))
 	}
-	// Remove the anchor references from the main ruleset.
-	if err := removePFAnchorRef(); err != nil {
-		logf("removing PF anchor ref: %v", err)
+	if shouldCleanupPfAnchors.CompareAndSwap(true, false) {
+		// Remove the anchor references from the main ruleset.
+		if err := removePFAnchorRef(logf); err != nil {
+			logf("removing PF anchor ref: %v", err)
+		}
 	}
 
 	// If the interface was left behind, ifconfig down will not remove it.
