@@ -218,10 +218,10 @@ func ensurePFAnchorRef(logf logger.Logf) error {
 		return nil // already present
 	}
 
-	err := loadPFMainRuleset(r.logf, scrubRules+newNat+newFilter)
+	err := loadPFMainRuleset(logf, scrubRules+newNat+newFilter)
 	if err == nil {
 		shouldCleanupPfAnchors.Store(true)
-		r.logf("added PF anchors to main ruleset")
+		logf("added PF anchors to main ruleset")
 	}
 	return err
 }
